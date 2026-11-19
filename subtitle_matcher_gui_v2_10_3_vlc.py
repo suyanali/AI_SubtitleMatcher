@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Subtitle Matcher v1.0
+Subtitle Matcher v2.10.3
 A 人工中文字幕 + B AI 中文字幕
 將 A 的文字套用到 B 的時間軸，支援手動配對與 AI 預配對。
 """
@@ -38,7 +38,7 @@ except ImportError:
 
 
 APP_NAME = "SubtitleMatcher"
-APP_VERSION = "2.9.1"
+APP_VERSION = "2.10.3"
 
 def get_app_dir() -> Path:
     """設定、暫存與紀錄固定放在程式／EXE 所在資料夾。"""
@@ -156,12 +156,12 @@ def clean_json_text(text: str) -> str:
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
     text = re.sub(r"\s*```$", "", text)
-    first_arr, last_arr = text.find("["), text.rfind("]")
-    if first_arr >= 0 and last_arr > first_arr:
-        return text[first_arr:last_arr + 1]
-    first_obj, last_obj = text.find("{"), text.rfind("}")
-    if first_obj >= 0 and last_obj > first_obj:
-        return text[first_obj:last_obj + 1]
+    # 優先解析最外層 JSON，避免 matches 物件被截成內部陣列。
+    obj, arr = text.find("{"), text.find("[")
+    if obj >= 0 and (arr < 0 or obj < arr):
+        return text[obj:text.rfind("}") + 1]
+    if arr >= 0:
+        return text[arr:text.rfind("]") + 1]
     return text
 
 
@@ -337,10 +337,22 @@ class ConfigManager:
                 return
 
 
+PROVIDER_LABELS = {
+    "OpenAI Compatible": "OpenAI 相容 API（自訂服務）",
+}
+PROVIDER_IDS = {label: provider for provider, label in PROVIDER_LABELS.items()}
+
+def provider_display(provider: str) -> str:
+    return PROVIDER_LABELS.get(provider, provider)
+
+def provider_internal(label: str) -> str:
+    return PROVIDER_IDS.get(label, label)
+
+
 PROVIDER_DEFAULTS = {
     "Gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta",
-        "model": "gemini-2.5-flash",
+        "model": "gemini-3.1-flash-lite",
     },
     "OpenAI": {
         "base_url": "https://api.openai.com/v1",
@@ -352,7 +364,7 @@ PROVIDER_DEFAULTS = {
     },
     "DeepSeek": {
         "base_url": "https://api.deepseek.com",
-        "model": "deepseek-chat",
+        "model": "deepseek-flash",
     },
     "OpenRouter": {
         "base_url": "https://openrouter.ai/api/v1",
@@ -387,76 +399,145 @@ class AIClient:
             return self._gemini(system_prompt, user_prompt)
         if self.provider == "Anthropic":
             return self._anthropic(system_prompt, user_prompt)
+        if self.provider == "Ollama":
+            return self._ollama(system_prompt, user_prompt)
         return self._openai_compatible(system_prompt, user_prompt)
+
+    @staticmethod
+    def _response_json(response):
+        try:
+            return response.json()
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("API 回傳不是有效 JSON，請檢查模型或服務商。") from exc
+
+    @staticmethod
+    def _nonempty(value, provider):
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"{provider} 回傳空白內容，請檢查模型與輸出 Token 上限。")
+        return value
 
     def _gemini(self, system_prompt: str, user_prompt: str) -> str:
         if not self.api_key:
             raise RuntimeError("Gemini API Key 未設定。")
         url = f"{self.base_url}/models/{self.model}:generateContent"
         headers = {"Content-Type": "application/json", "x-goog-api-key": self.api_key}
+        generation = {"maxOutputTokens": self.max_tokens, "responseMimeType": "application/json"}
+        thinking = bool(self.profile.get("thinking", False))
+        model = self.model.lower()
+        if model.startswith("gemini-2.5-flash"):
+            generation["thinkingConfig"] = {"thinkingBudget": -1 if thinking else 0}
+            generation["temperature"] = self.temperature
+        elif model.startswith("gemini-2.5-pro"):
+            # Pro 不支援關閉思考；未啟用時維持官方模型預設。
+            generation["temperature"] = self.temperature
+        elif model.startswith("gemini-3"):
+            # 3.x 的最低思考量並非真正關閉；不傳 temperature 以免干擾模型預設。
+            generation["thinkingConfig"] = {"thinkingLevel": "HIGH" if thinking else "LOW"}
+        else:
+            # 自訂模型不猜測思考參數，避免未知模型 400。
+            generation["temperature"] = self.temperature
         payload = {
             "systemInstruction": {"parts": [{"text": system_prompt}]},
             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-            "generationConfig": {
-                "temperature": self.temperature,
-                "maxOutputTokens": self.max_tokens,
-                "responseMimeType": "application/json",
-            },
+            "generationConfig": generation,
         }
         r = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
         self._raise(r)
-        data = r.json()
+        data = self._response_json(r)
         candidates = data.get("candidates") or []
         if not candidates:
-            raise RuntimeError(f"Gemini 沒有回傳內容：{data}")
-        parts = candidates[0].get("content", {}).get("parts", [])
-        return "".join(p.get("text", "") for p in parts)
+            raise RuntimeError("Gemini 沒有回傳候選內容。")
+        candidate = candidates[0]
+        if candidate.get("finishReason") == "MAX_TOKENS":
+            raise RuntimeError("Gemini 輸出被 Token 上限截斷。")
+        parts = candidate.get("content", {}).get("parts", [])
+        return self._nonempty("".join(p.get("text", "") for p in parts if not p.get("thought")), "Gemini")
 
     def _anthropic(self, system_prompt: str, user_prompt: str) -> str:
         if not self.api_key:
             raise RuntimeError("Anthropic API Key 未設定。")
-        url = f"{self.base_url}/messages"
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": self.api_key,
-            "anthropic-version": "2023-06-01",
-        }
-        payload = {
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_prompt}],
-        }
-        r = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+        headers = {"Content-Type": "application/json", "x-api-key": self.api_key,
+                   "anthropic-version": "2023-06-01"}
+        payload = {"model": self.model, "max_tokens": self.max_tokens,
+                   "system": system_prompt,
+                   "messages": [{"role": "user", "content": user_prompt}]}
+        if self.profile.get("thinking", False):
+            # 新舊 Claude 思考能力不同：只在已辨識的模型設定。
+            if any(x in self.model.lower() for x in ("4-6", "4.6", "4-7", "4.7", "4-8", "4.8")):
+                payload["thinking"] = {"type": "adaptive"}
+            else:
+                raise RuntimeError("此 Claude 模型的思考參數未確認；請先關閉思考模式或使用相容模型。")
+        else:
+            payload["temperature"] = self.temperature
+        r = requests.post(f"{self.base_url}/messages", headers=headers, json=payload, timeout=self.timeout)
         self._raise(r)
-        data = r.json()
-        return "".join(x.get("text", "") for x in data.get("content", []) if x.get("type") == "text")
+        data = self._response_json(r)
+        if data.get("stop_reason") == "max_tokens":
+            raise RuntimeError("Anthropic 輸出被 Token 上限截斷。")
+        return self._nonempty("".join(x.get("text", "") for x in data.get("content", [])
+                                      if x.get("type") == "text"), "Anthropic")
+
+    def _ollama(self, system_prompt: str, user_prompt: str) -> str:
+        base = self.base_url.removesuffix("/v1").rstrip("/")
+        payload = {
+            "model": self.model, "stream": False,
+            "think": bool(self.profile.get("thinking", False)), "format": "json",
+            "messages": [{"role": "system", "content": system_prompt},
+                         {"role": "user", "content": user_prompt}],
+            "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
+        }
+        r = requests.post(f"{base}/api/chat", json=payload, timeout=self.timeout)
+        self._raise(r)
+        data = self._response_json(r)
+        return self._nonempty(data.get("message", {}).get("content", ""), "Ollama")
 
     def _openai_compatible(self, system_prompt: str, user_prompt: str) -> str:
-        url = f"{self.base_url}/chat/completions"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         if self.provider == "OpenRouter":
             headers["HTTP-Referer"] = self.profile.get("site_url", "") or "https://localhost"
             headers["X-Title"] = self.profile.get("site_name", "") or APP_NAME
-        payload = {
-            "model": self.model,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        r = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+        payload = {"model": self.model,
+                   "messages": [{"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt}]}
+        thinking = bool(self.profile.get("thinking", False))
+        if self.provider == "DeepSeek":
+            payload.update(max_tokens=self.max_tokens,
+                           response_format={"type": "json_object"},
+                           thinking={"type": "enabled" if thinking else "disabled"})
+            if not thinking:
+                payload["temperature"] = self.temperature
+        elif self.provider == "OpenAI":
+            model = self.model.lower()
+            reasoning_model = model.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6"))
+            if reasoning_model:
+                payload["max_completion_tokens"] = self.max_tokens
+                # 不支援 none 的模型不可強制送 none；預設關閉表示不主動要求額外推理。
+                if thinking:
+                    payload["reasoning_effort"] = "low"
+            else:
+                payload["max_tokens"] = self.max_tokens
+                payload["temperature"] = self.temperature
+            payload["response_format"] = {"type": "json_object"}
+        elif self.provider == "OpenRouter":
+            payload["max_tokens"] = self.max_tokens
+            payload["reasoning"] = {"enabled": thinking}
+            # OpenRouter 下游模型可能不支援 JSON mode / temperature，故不強制傳入。
+        else:
+            payload["max_tokens"] = self.max_tokens
+            payload["temperature"] = self.temperature
+        r = requests.post(f"{self.base_url}/chat/completions", headers=headers,
+                          json=payload, timeout=self.timeout)
         self._raise(r)
-        data = r.json()
+        data = self._response_json(r)
         try:
-            return data["choices"][0]["message"]["content"]
-        except Exception:
-            raise RuntimeError(f"API 回傳格式無法解析：{data}")
+            choice = data["choices"][0]
+            if choice.get("finish_reason") == "length":
+                raise RuntimeError("輸出達到 Token 上限，請縮小分段或提高輸出上限。")
+            return self._nonempty(choice["message"]["content"], self.provider)
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError("API 回傳缺少 choices[0].message.content。") from exc
 
     @staticmethod
     def _raise(response: Any) -> None:
@@ -488,6 +569,7 @@ class ProfileDialog(tk.Toplevel):
         self.temp_var = tk.StringVar(value="0")
         self.tokens_var = tk.StringVar(value="8192")
         self.timeout_var = tk.StringVar(value="180")
+        self.thinking_var = tk.BooleanVar(value=False)
         self.site_name_var = tk.StringVar(value=APP_NAME)
         self.site_url_var = tk.StringVar()
 
@@ -519,17 +601,21 @@ class ProfileDialog(tk.Toplevel):
             ("OpenRouter 網站名稱", self.site_name_var),
             ("OpenRouter 網站網址", self.site_url_var),
         ]
+        self.provider_only_widgets = []
         for row, (label, var) in enumerate(fields):
             ttk.Label(right, text=label).grid(row=row, column=0, sticky="w", pady=5)
             if label == "服務商":
                 widget = ttk.Combobox(
-                    right, textvariable=var, values=list(PROVIDER_DEFAULTS.keys()),
+                    right, textvariable=var, values=[provider_display(p) for p in PROVIDER_DEFAULTS],
                     state="readonly", width=44
                 )
                 widget.bind("<<ComboboxSelected>>", self.provider_changed)
             else:
                 widget = ttk.Entry(right, textvariable=var, width=47, show="*" if label == "API Key" else "")
             widget.grid(row=row, column=1, sticky="ew", pady=5)
+            if label.startswith("OpenRouter 網站"):
+                self.provider_only_widgets.append((right.grid_slaves(row=row, column=0)[0], widget))
+        ttk.Checkbutton(right, text="啟用思考模式（預設關閉；部分模型無法完全關閉）", variable=self.thinking_var).grid(row=len(fields), column=0, columnspan=2, sticky="w")
         right.columnconfigure(1, weight=1)
 
         info = ttk.Label(
@@ -540,14 +626,16 @@ class ProfileDialog(tk.Toplevel):
             foreground="#555",
             wraplength=450,
         )
-        info.grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=10)
+        info.grid(row=len(fields)+1, column=0, columnspan=2, sticky="w", pady=10)
 
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
         ttk.Button(bottom, text="測試目前設定", command=self.test_profile).pack(side="left")
+        ttk.Button(bottom, text="查詢 Ollama 模型", command=self.list_ollama_models).pack(side="left", padx=5)
         ttk.Button(bottom, text="儲存", command=self.save_all).pack(side="right")
         ttk.Button(bottom, text="取消", command=self.destroy).pack(side="right", padx=5)
 
+        self._refresh_provider_fields()
         self.refresh_list()
         if self.profiles:
             self.listbox.selection_set(0)
@@ -566,7 +654,7 @@ class ProfileDialog(tk.Toplevel):
             return
         p = {
             "name": name,
-            "provider": self.provider_var.get(),
+            "provider": provider_internal(self.provider_var.get()),
             "api_key": self.key_var.get().strip(),
             "base_url": self.base_var.get().strip(),
             "model": self.model_var.get().strip(),
@@ -575,8 +663,9 @@ class ProfileDialog(tk.Toplevel):
             "timeout": int(self.timeout_var.get() or 180),
             "site_name": self.site_name_var.get().strip(),
             "site_url": self.site_url_var.get().strip(),
+            "thinking": self.thinking_var.get(),
         }
-        self.profiles[self.current_index] = p
+        self.profiles[self.current_index] = {**self.profiles[self.current_index], **p}
 
     def on_select(self, _event=None):
         if self.current_index is not None:
@@ -590,15 +679,17 @@ class ProfileDialog(tk.Toplevel):
         self.current_index = int(sel[0])
         p = self.profiles[self.current_index]
         self.name_var.set(p.get("name", ""))
-        self.provider_var.set(p.get("provider", "Gemini"))
+        self.provider_var.set(provider_display(p.get("provider", "Gemini")))
         self.base_var.set(p.get("base_url", ""))
         self.model_var.set(p.get("model", ""))
+        self.thinking_var.set(bool(p.get("thinking", False)))
         self.temp_var.set(str(p.get("temperature", 0)))
         self.tokens_var.set(str(p.get("max_tokens", 8192)))
         self.timeout_var.set(str(p.get("timeout", 180)))
         self.site_name_var.set(p.get("site_name", APP_NAME))
         self.site_url_var.set(p.get("site_url", ""))
         self.key_var.set(p.get("api_key", self.config_mgr.get_key(p.get("name", ""))))
+        self._refresh_provider_fields()
 
     def new_profile(self):
         if self.current_index is not None:
@@ -629,17 +720,28 @@ class ProfileDialog(tk.Toplevel):
                 self.listbox.selection_set(min(idx, len(self.profiles)-1))
                 self.on_select()
 
+    def _refresh_provider_fields(self):
+        is_openrouter = provider_internal(self.provider_var.get()) == "OpenRouter"
+        for label, field in self.provider_only_widgets:
+            if is_openrouter:
+                label.grid()
+                field.grid()
+            else:
+                label.grid_remove()
+                field.grid_remove()
+
     def provider_changed(self, _event=None):
-        provider = self.provider_var.get()
+        provider = provider_internal(self.provider_var.get())
         d = PROVIDER_DEFAULTS.get(provider, {})
         self.base_var.set(d.get("base_url", ""))
         self.model_var.set(d.get("model", ""))
+        self._refresh_provider_fields()
 
     def get_current_profile(self) -> Tuple[Dict[str, Any], str]:
         name = self.name_var.get().strip() or "臨時設定"
         return ({
             "name": name,
-            "provider": self.provider_var.get(),
+            "provider": provider_internal(self.provider_var.get()),
             "base_url": self.base_var.get().strip(),
             "model": self.model_var.get().strip(),
             "temperature": float(self.temp_var.get() or 0),
@@ -647,7 +749,24 @@ class ProfileDialog(tk.Toplevel):
             "timeout": int(self.timeout_var.get() or 180),
             "site_name": self.site_name_var.get().strip(),
             "site_url": self.site_url_var.get().strip(),
+            "thinking": self.thinking_var.get(),
         }, self.key_var.get().strip())
+
+    def list_ollama_models(self):
+        if provider_internal(self.provider_var.get()) != "Ollama":
+            messagebox.showinfo("Ollama", "請先選擇 Ollama 服務商。", parent=self)
+            return
+        try:
+            base = self.base_var.get().strip().rstrip("/").removesuffix("/v1")
+            response = requests.get(f"{base}/api/tags", timeout=10)
+            AIClient._raise(response)
+            names = [m.get("name", "") for m in response.json().get("models", []) if m.get("name")]
+            if not names:
+                raise RuntimeError("找不到已安裝的 Ollama 模型。")
+            self.model_var.set(names[0])
+            messagebox.showinfo("本機模型（已選擇第一個）", "\n".join(names[:35]), parent=self)
+        except Exception as exc:
+            messagebox.showerror("查詢失敗", str(exc), parent=self)
 
     def test_profile(self):
         try:
@@ -656,7 +775,10 @@ class ProfileDialog(tk.Toplevel):
                 "只回傳 JSON。",
                 '請只回傳：{"ok":true}'
             )
-            messagebox.showinfo("測試成功", result[:500], parent=self)
+            parsed = json.loads(clean_json_text(result))
+            if not isinstance(parsed, dict) or parsed.get("ok") is not True:
+                raise ValueError('回傳不是預期 JSON：{"ok":true}')
+            messagebox.showinfo("測試成功", f"模型：{p['model']}\nJSON 格式有效。", parent=self)
         except Exception as e:
             messagebox.showerror("測試失敗", str(e), parent=self)
 
@@ -1676,11 +1798,10 @@ class SubtitleMatcherApp(tk.Tk):
             "建議流程\n"
             "1. 載入 A 與 B 字幕。\n"
             "2. 第一次使用先進入「API／模型設定」，新增設定檔、填入 API Key 並測試。\n"
-            "3. 執行 AI 配對；會依目前設定自動分段送給 AI。\n"
-            "4. 開啟「AI 檢查報告」，依序檢查 AI 未回傳、疑似異常配對等項目。\n"
-            "5. 處理「配對衝突」、處理「無對應 A」再處理「無對應 B」。\n"
+            "3. 執行 AI 配對；每次預設送出 80 條 A 字幕。\n"
+            "4. 先處理「配對衝突」，再處理「無對應 A／B」。\n"
             "5. 刪除不需要保留的 A 或 B 字幕，並人工修正錯誤配對。\n"
-            "6. 全選 A 字幕，並取消 B 的選取，再使用「合併多A→單B」\n"
+            "6. 需要時選取範圍後執行「合併多A→單B」。\n"
             "7. 輸出 SRT，再到專業字幕軟體進行最後檢查與微調。\n\n"
             "資料位置\n"
             "config.json、autosave_project.json、temp 與 logs 都存放在程式同一資料夾。\n"
@@ -3474,7 +3595,16 @@ class SubtitleMatcherApp(tk.Tk):
                     current_chunk = n
                     current_a_ids = a_ids
                     self.after(0, lambda n=n, total=total: self.set_status(f"AI 配對中：{n}/{total}"))
-                    report = self.request_match(client, a_ids, b_ids)
+                    for attempt in range(3):
+                        try:
+                            report = self.request_match(client, a_ids, b_ids)
+                            break
+                        except Exception as exc:
+                            message = str(exc)
+                            transient = any(x in message for x in ("429", "500", "502", "503", "504", "空白", "Token 上限", "JSONDecodeError", "Expecting value"))
+                            if attempt == 2 or not transient:
+                                raise
+                            time.sleep(min(2 ** attempt, 4))
                     done = threading.Event()
 
                     def apply_chunk(report=report, n=n):
@@ -3525,17 +3655,17 @@ class SubtitleMatcherApp(tk.Tk):
             "你是字幕版本配對工具。A 是人工校正版，B 是同一內容的另一影片或版本之 AI／初步字幕。"
             "請依語意與對話順序配對，即使換句話說、同義改寫、語氣不同，也可視為同一句。"
             "允許 1對1、1對多、多對1。不同版本的增刪內容可以無對應。"
-            "不可只靠字面相似度。只輸出 JSON 陣列，不要解釋。"
+            "不可只靠字面相似度。只輸出 JSON 物件，最外層包含 matches 陣列，不要解釋。"
         )
         user = f"""
 請配對下列字幕。
 
 輸出格式：
-[
+{{"matches": [
   {{"a": 101, "b": [98], "confidence": 0.95, "note": ""}},
   {{"a": 102, "b": [99,100], "confidence": 0.82, "note": "B 拆成兩句"}},
   {{"a": 103, "b": [], "confidence": 0.90, "note": "A 在 B 無對應"}}
-]
+]}}
 
 規則：
 1. a、b 使用畫面中的原字幕編號，不是陣列索引。
@@ -3553,7 +3683,7 @@ B 字幕：
         raw = client.complete(system, user)
         data = json.loads(clean_json_text(raw))
         if isinstance(data, dict):
-            data = data.get("matches", [])
+            data = data.get("matches")
         if not isinstance(data, list):
             raise RuntimeError("AI 回傳不是 JSON 陣列。")
 
