@@ -139,6 +139,10 @@ temp/
 - temp：暫存資料
 
 ---
+# TO DO LIST：  
+- bug：編輯字幕時按enter會觸發配對的enter  
+
+---
 
 # License
 
